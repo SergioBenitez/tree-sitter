@@ -592,6 +592,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_regex"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8136f1a4ea815d7eac4101cfd0b16dc0cb5e1fe1b8609dfd728058656b7badf"
+dependencies = [
+ "regex",
+ "serde",
+]
+
+[[package]]
 name = "smallbitvec"
 version = "2.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -720,6 +730,8 @@ dependencies = [
  "cc",
  "lazy_static",
  "regex",
+ "serde",
+ "serde_regex",
 ]
 
 [[package]]
@@ -775,6 +787,8 @@ name = "tree-sitter-highlight"
 version = "0.20.1"
 dependencies = [
  "regex",
+ "serde",
+ "serde_regex",
  "thiserror",
  "tree-sitter",
 ]

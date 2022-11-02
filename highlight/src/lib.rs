@@ -7,7 +7,7 @@ use std::{iter, mem, ops, str, usize};
 use thiserror::Error;
 use tree_sitter::{
     Language, LossyUtf8, Node, Parser, Point, Query, QueryCaptures, QueryCursor, QueryError,
-    QueryMatch, Range, Tree,
+    QueryMatch, Range, Tree, QueryDehydrated,
 };
 
 const CANCELLATION_CHECK_INTERVAL: usize = 100;
@@ -16,6 +16,7 @@ const BUFFER_LINES_RESERVE_CAPACITY: usize = 1000;
 
 /// Indicates which highlight should be applied to a region of source code.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Highlight(pub usize);
 
 /// Represents the reason why syntax highlighting failed.
@@ -54,6 +55,49 @@ pub struct HighlightConfiguration {
     local_def_capture_index: Option<u32>,
     local_def_value_capture_index: Option<u32>,
     local_ref_capture_index: Option<u32>,
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug)]
+pub struct HighlightConfigurationDehydrated<'a> {
+    query_source: String,
+    query_metadata: QueryDehydrated,
+    injections_query_source: &'a str,
+    combined_injections_query_metadata: Option<QueryDehydrated>,
+    locals_pattern_index: usize,
+    highlights_pattern_index: usize,
+    highlight_indices: Vec<Option<Highlight>>,
+    non_local_variable_patterns: Vec<bool>,
+    injection_content_capture_index: Option<u32>,
+    injection_language_capture_index: Option<u32>,
+    local_scope_capture_index: Option<u32>,
+    local_def_capture_index: Option<u32>,
+    local_def_value_capture_index: Option<u32>,
+    local_ref_capture_index: Option<u32>,
+}
+
+impl HighlightConfigurationDehydrated<'_> {
+    pub fn hydrate(self, language: Language) -> Result<HighlightConfiguration, QueryError> {
+        let injections_query_source = self.injections_query_source;
+        Ok(HighlightConfiguration {
+            language,
+            query: self.query_metadata
+                .hydrate(language, &self.query_source)?,
+            combined_injections_query: self.combined_injections_query_metadata
+                .map(|q| q.hydrate(language, &injections_query_source))
+                .transpose()?,
+            locals_pattern_index: self.locals_pattern_index,
+            highlights_pattern_index: self.highlights_pattern_index,
+            highlight_indices: self.highlight_indices,
+            non_local_variable_patterns: self.non_local_variable_patterns,
+            injection_content_capture_index: self.injection_content_capture_index,
+            injection_language_capture_index: self.injection_language_capture_index,
+            local_scope_capture_index: self.local_scope_capture_index,
+            local_def_capture_index: self.local_def_capture_index,
+            local_def_value_capture_index: self.local_def_value_capture_index,
+            local_ref_capture_index: self.local_ref_capture_index,
+        })
+    }
 }
 
 /// Performs syntax highlighting, recognizing a given list of highlight names.
@@ -150,12 +194,12 @@ impl Highlighter {
         assert_ne!(layers.len(), 0);
         let mut result = HighlightIter {
             source,
+            layers,
             byte_offset: 0,
             injection_callback,
             cancellation_flag,
             highlighter: self,
             iter_count: 0,
-            layers: layers,
             next_event: None,
             last_highlight_range: None,
         };
@@ -165,26 +209,13 @@ impl Highlighter {
 }
 
 impl HighlightConfiguration {
-    /// Creates a `HighlightConfiguration` for a given `Language` and set of highlighting
-    /// queries.
-    ///
-    /// # Parameters
-    ///
-    /// * `language`  - The Tree-sitter `Language` that should be used for parsing.
-    /// * `highlights_query` - A string containing tree patterns for syntax highlighting. This
-    ///   should be non-empty, otherwise no syntax highlights will be added.
-    /// * `injections_query` -  A string containing tree patterns for injecting other languages
-    ///   into the document. This can be empty if no injections are desired.
-    /// * `locals_query` - A string containing tree patterns for tracking local variable
-    ///   definitions and references. This can be empty if local variable tracking is not needed.
-    ///
-    /// Returns a `HighlightConfiguration` that can then be used with the `highlight` method.
-    pub fn new(
+    pub fn new_dehydrated<'a, S: AsRef<str>>(
         language: Language,
         highlights_query: &str,
-        injection_query: &str,
+        injection_query: &'a str,
         locals_query: &str,
-    ) -> Result<Self, QueryError> {
+        recognized_names: &[S],
+    ) -> Result<HighlightConfigurationDehydrated<'a>, QueryError> {
         // Concatenate the query strings, keeping track of the start offset of each section.
         let mut query_source = String::new();
         query_source.push_str(injection_query);
@@ -261,7 +292,7 @@ impl HighlightConfiguration {
         }
 
         let highlight_indices = vec![None; query.capture_names().len()];
-        Ok(HighlightConfiguration {
+        let mut config = HighlightConfiguration {
             language,
             query,
             combined_injections_query,
@@ -271,11 +302,55 @@ impl HighlightConfiguration {
             non_local_variable_patterns,
             injection_content_capture_index,
             injection_language_capture_index,
+            local_scope_capture_index,
+            local_def_capture_index,
+            local_def_value_capture_index,
+            local_ref_capture_index,
+        };
+
+        config.configure(recognized_names);
+        Ok(HighlightConfigurationDehydrated {
+            query_source,
+            query_metadata: config.query.dehydrate(),
+            injections_query_source: injection_query,
+            combined_injections_query_metadata: config
+                .combined_injections_query.map(|q| q.dehydrate()),
+            locals_pattern_index,
+            highlights_pattern_index,
+            highlight_indices: config.highlight_indices,
+            non_local_variable_patterns: config.non_local_variable_patterns,
+            injection_content_capture_index,
+            injection_language_capture_index,
             local_def_capture_index,
             local_def_value_capture_index,
             local_ref_capture_index,
             local_scope_capture_index,
         })
+    }
+
+    /// Creates a `HighlightConfiguration` for a given `Language` and set of highlighting
+    /// queries.
+    ///
+    /// # Parameters
+    ///
+    /// * `language`  - The Tree-sitter `Language` that should be used for parsing.
+    /// * `highlights_query` - A string containing tree patterns for syntax highlighting. This
+    ///   should be non-empty, otherwise no syntax highlights will be added.
+    /// * `injections_query` -  A string containing tree patterns for injecting other languages
+    ///   into the document. This can be empty if no injections are desired.
+    /// * `locals_query` - A string containing tree patterns for tracking local variable
+    ///   definitions and references. This can be empty if local variable tracking is not needed.
+    ///
+    /// Returns a `HighlightConfiguration` that can then be used with the `highlight` method.
+    #[inline]
+    pub fn new(
+        language: Language,
+        highlights_query: &str,
+        injection_query: &str,
+        locals_query: &str,
+    ) -> Result<Self, QueryError> {
+        Self::new_dehydrated::<&str>(language, highlights_query, injection_query, locals_query, &[])
+            .and_then(|config| config.hydrate(language))
     }
 
     /// Get a slice containing all of the highlight names used in the configuration.

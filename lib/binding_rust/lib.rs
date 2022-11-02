@@ -10,7 +10,7 @@ use std::{
     fmt, hash, iter,
     marker::PhantomData,
     mem::MaybeUninit,
-    ops,
+    ops::{self, Deref, DerefMut},
     os::raw::{c_char, c_void},
     ptr::{self, NonNull},
     slice, str,
@@ -105,6 +105,12 @@ pub struct TreeCursor<'a>(ffi::TSTreeCursor, PhantomData<&'a ()>);
 #[derive(Debug)]
 pub struct Query {
     ptr: NonNull<ffi::TSQuery>,
+    pub metadata: QueryDehydrated,
+}
+
+#[derive(Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct QueryDehydrated {
     capture_names: Vec<String>,
     capture_quantifiers: Vec<Vec<CaptureQuantifier>>,
     text_predicates: Vec<Box<[TextPredicate]>>,
@@ -113,8 +119,58 @@ pub struct Query {
     general_predicates: Vec<Box<[QueryPredicate]>>,
 }
 
+impl Deref for Query {
+    type Target = QueryDehydrated;
+
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+
+impl DerefMut for Query {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.metadata
+    }
+}
+
+impl QueryDehydrated {
+    pub fn hydrate(self, language: Language, source: &str) -> Result<Query, QueryError> {
+        let ptr = unsafe {
+            let mut error_offset = 0u32;
+            let mut error_type: ffi::TSQueryError = 0;
+            let bytes = source.as_bytes();
+
+            ffi::ts_query_new(
+                language.0,
+                bytes.as_ptr() as *const c_char,
+                bytes.len() as u32,
+                &mut error_offset as *mut u32,
+                &mut error_type as *mut ffi::TSQueryError,
+            )
+        };
+
+        if ptr.is_null() {
+            return Err(QueryError {
+                row: 0,
+                column: 0,
+                offset: 0,
+                message: LanguageError {
+                    version: language.version(),
+                }.to_string(),
+                kind: QueryErrorKind::Language,
+            });
+        }
+
+        Ok(Query {
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
+            metadata: self,
+        })
+    }
+}
+
 /// A quantifier for captures
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CaptureQuantifier {
     Zero,
     ZeroOrOne,
@@ -144,6 +200,7 @@ pub struct QueryCursor {
 
 /// A key-value pair associated with a particular pattern in a `Query`.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct QueryProperty {
     pub key: Box<str>,
     pub value: Option<Box<str>>,
@@ -151,6 +208,7 @@ pub struct QueryProperty {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum QueryPredicateArg {
     Capture(u32),
     String(Box<str>),
@@ -158,6 +216,7 @@ pub enum QueryPredicateArg {
 
 /// A key-value pair associated with a particular pattern in a `Query`.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct QueryPredicate {
     pub operator: Box<str>,
     pub args: Vec<QueryPredicateArg>,
@@ -236,10 +295,16 @@ pub enum QueryErrorKind {
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 enum TextPredicate {
     CaptureEqString(u32, String, bool),
     CaptureEqCapture(u32, u32, bool),
-    CaptureMatchString(u32, regex::bytes::Regex, bool),
+    CaptureMatchString(
+        u32,
+        #[cfg_attr(feature = "serde", serde(with = "serde_regex"))]
+        regex::bytes::Regex,
+        bool
+    ),
 }
 
 // TODO: Remove this struct at at some point. If `core::str::lossy::Utf8Lossy`
@@ -1417,20 +1482,21 @@ impl Query {
         let pattern_count = unsafe { ffi::ts_query_pattern_count(ptr) as usize };
         let mut result = Query {
             ptr: unsafe { NonNull::new_unchecked(ptr) },
-            capture_names: Vec::with_capacity(capture_count as usize),
-            capture_quantifiers: Vec::with_capacity(pattern_count as usize),
-            text_predicates: Vec::with_capacity(pattern_count),
-            property_predicates: Vec::with_capacity(pattern_count),
-            property_settings: Vec::with_capacity(pattern_count),
-            general_predicates: Vec::with_capacity(pattern_count),
+            metadata: QueryDehydrated {
+                capture_names: Vec::with_capacity(capture_count as usize),
+                capture_quantifiers: Vec::with_capacity(pattern_count as usize),
+                text_predicates: Vec::with_capacity(pattern_count),
+                property_predicates: Vec::with_capacity(pattern_count),
+                property_settings: Vec::with_capacity(pattern_count),
+                general_predicates: Vec::with_capacity(pattern_count),
+            },
         };
 
         // Build a vector of strings to store the capture names.
         for i in 0..capture_count {
             unsafe {
                 let mut length = 0u32;
-                let name =
-                    ffi::ts_query_capture_name_for_id(ptr, i, &mut length as *mut u32) as *const u8;
+                let name = ffi::ts_query_capture_name_for_id(ptr, i, &mut length as *mut u32) as *const u8;
                 let name = slice::from_raw_parts(name, length as usize);
                 let name = str::from_utf8_unchecked(name);
                 result.capture_names.push(name.to_string());
@@ -1623,6 +1689,10 @@ impl Query {
                 .push(general_predicates.into_boxed_slice());
         }
         Ok(result)
+    }
+
+    pub fn dehydrate(mut self) -> QueryDehydrated {
+        std::mem::replace(&mut self.metadata, QueryDehydrated::default())
     }
 
     /// Get the byte offset where the given pattern starts in the query's source.
